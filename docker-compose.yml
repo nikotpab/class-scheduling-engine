@@ -1,0 +1,108 @@
+version: "3.9"
+
+# ── Shared configuration ──────────────────────────────────────────────────────
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks:
+    - scheduling-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ── API Server ──────────────────────────────────────────────────────────────
+  api:
+    <<: *app-base
+    container_name: scheduling-api
+    ports:
+      - "8000:8000"
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Celery Worker ───────────────────────────────────────────────────────────
+  worker:
+    <<: *app-base
+    container_name: scheduling-worker
+    command: >
+      celery -A src.infrastructure.messaging.celery_app:celery_app worker
+      --loglevel=info
+      --queues=scheduling
+      --concurrency=2
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A src.infrastructure.messaging.celery_app:celery_app inspect ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Celery Flower (monitoring dashboard) ────────────────────────────────────
+  flower:
+    <<: *app-base
+    container_name: scheduling-flower
+    command: >
+      celery -A src.infrastructure.messaging.celery_app:celery_app flower
+      --port=5555
+    ports:
+      - "5555:5555"
+    profiles: ["dev"]  # Only starts with: docker compose --profile dev up
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: scheduling-postgres
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: scheduling_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduling_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scheduling-net
+    restart: unless-stopped
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: scheduling-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scheduling-net
+    restart: unless-stopped
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+  redis-data:
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  scheduling-net:
+    driver: bridge
