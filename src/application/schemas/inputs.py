@@ -40,6 +40,7 @@ class SubjectInput(BaseModel):
     required_sessions: Annotated[int, Field(ge=1, le=30)]
     campus_id: Annotated[str, Field(min_length=1, max_length=64)]
     student_count: Annotated[int, Field(ge=0)] = 0
+    eligible_teacher_ids: list[str] = Field(default_factory=list)
 
 
 class RoomInput(BaseModel):
@@ -81,7 +82,7 @@ class ScheduleGenerationRequest(BaseModel):
     rooms: Annotated[list[RoomInput], Field(min_length=1, max_length=10000)]
     timeslots: Annotated[list[TimeslotInput], Field(min_length=1, max_length=10000)]
     penalty_weights: PenaltyWeightsInput = Field(default_factory=PenaltyWeightsInput)
-    solver: Literal["pulp_cbc", "tabu_search"] = "pulp_cbc"
+    solver: Literal["pulp_cbc", "tabu_search", "ortools_cpsat"] = "pulp_cbc"
     time_limit_seconds: Annotated[int, Field(ge=10, le=3600)] = 300
 
     @model_validator(mode="after")

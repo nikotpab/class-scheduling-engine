@@ -44,6 +44,7 @@ def _map_request_to_problem(request: ScheduleGenerationRequest) -> SchedulingPro
             required_sessions=s.required_sessions,
             campus_id=s.campus_id,
             student_count=s.student_count,
+            eligible_teacher_ids=frozenset(s.eligible_teacher_ids),
         )
         for s in request.subjects
     ]
