@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import time as _time
+import collections
 import logging
-from collections import defaultdict
+import time as _time
 
 from ortools.sat.python import cp_model
 
@@ -16,223 +16,257 @@ logger = logging.getLogger(__name__)
 
 class OrToolsCPSolver(ISolver):
     """
-    Constraint Programming solver using Google OR-Tools CP-SAT.
-    Orders of magnitude faster than MILP for Timetabling problems.
+    Production-ready ISolver implementation using Google OR-Tools CP-SAT.
+    Replaces the PuLP/CBC implementation to resolve combinatorial explosions by:
+    1. Using logical pruning to only instantiate valid Boolean variables.
+    2. Exploiting the multithreaded architecture of CP-SAT.
+    3. Correctly modeling constraints using integer/boolean math rather than
+       heavy linear expressions.
     """
 
     def solve(self, problem: SchedulingProblem) -> ScheduleResult:
         t_start = _time.perf_counter()
 
+        try:
+            result = self._build_and_solve(problem)
+        except Exception as exc:
+            raise SolverError(f"ORTools solver failed unexpectedly: {exc}") from exc
+
+        elapsed = _time.perf_counter() - t_start
+        result.solve_time_seconds = elapsed
+        return result
+
+    def _build_and_solve(self, problem: SchedulingProblem) -> ScheduleResult:
         model = cp_model.CpModel()
 
-        teachers = problem.teachers
-        subjects = problem.subjects
-        rooms = problem.rooms
-        timeslots = problem.timeslots
-        weights = problem.penalty_weights
+        # Variable grouping maps (O(1) lookups for constraint building)
+        by_subject = collections.defaultdict(list)
+        by_teacher_slot = collections.defaultdict(list)
+        by_room_slot = collections.defaultdict(list)
+        by_teacher_day = collections.defaultdict(list)
+        by_teacher_day_campus = collections.defaultdict(list)
+        by_subject_day = collections.defaultdict(list)
 
-        subject_map = {s.id: s for s in subjects}
-        teacher_map = {t.id: t for t in teachers}
-        room_map = {r.id: r for r in rooms}
-
-        days = sorted(list({ts.day for ts in timeslots}))
-        procom_teachers = [t for t in teachers if t.teacher_type == TeacherType.PROCOM]
-
-        # X[(t_id, s_id, r_id, day, slot)] -> Boolean Variable
-        X = {}
+        var_to_assignment = {}
         
-        # Aggregation tools
-        vars_by_subject = defaultdict(list)
-        vars_by_teacher_slot = defaultdict(list)
-        vars_by_room_slot = defaultdict(list)
-        vars_by_teacher_day = defaultdict(list)
-        vars_by_teacher_campus_day_slot = defaultdict(list)
-        vars_by_teacher_campus_day = defaultdict(list)
-        vars_by_subject_day = defaultdict(list)
-
-        logger.info("Building CP-SAT Model...")
-
-        for subject in subjects:
-            valid_teachers = [t for t in teachers if t.id in subject.eligible_teacher_ids]
-            valid_rooms = [r for r in rooms if r.campus_id == subject.campus_id and r.can_fit(subject.student_count)]
-            
-            for teacher in valid_teachers:
-                for ts in timeslots:
-                    if teacher.availability.slots and teacher.is_restricted(ts.day, ts.slot_index):
-                        continue
-                    if teacher.teacher_type == TeacherType.PROJEX and not ts.is_extended_hours:
-                        continue
-                    
-                    for room in valid_rooms:
-                        # Boolean variable for this exact assignment
-                        var = model.NewBoolVar(f"X_{teacher.id}_{subject.id}_{room.id}_{ts.day}_{ts.slot_index}")
-                        key = (teacher.id, subject.id, room.id, ts.day, ts.slot_index)
-                        X[key] = var
-                        
-                        vars_by_subject[subject.id].append(var)
-                        vars_by_teacher_slot[(teacher.id, ts.day, ts.slot_index)].append(var)
-                        vars_by_room_slot[(room.id, ts.day, ts.slot_index)].append(var)
-                        vars_by_teacher_day[(teacher.id, ts.day)].append(var)
-                        vars_by_teacher_campus_day_slot[(teacher.id, subject.campus_id, ts.day, ts.slot_index)].append(var)
-                        vars_by_teacher_campus_day[(teacher.id, subject.campus_id, ts.day)].append(var)
-                        vars_by_subject_day[(subject.id, ts.day)].append(var)
-
-        # ── HARD CONSTRAINTS ─────────────────────────────────────────────────
-
-        # R6: Exactly required_sessions per subject
-        for subject in subjects:
-            if vars_by_subject[subject.id]:
-                model.Add(sum(vars_by_subject[subject.id]) == subject.required_sessions)
-            elif subject.required_sessions > 0:
-                # Subject cannot be scheduled (no valid teachers/rooms)
-                model.AddBoolOr([]) # Force infeasible
-
-        # R4: Teacher cannot be in two places at once
-        for var_list in vars_by_teacher_slot.values():
-            if len(var_list) > 1:
-                model.AddAtMostOne(var_list)
-
-        # R7: Room cannot host two classes at once
-        for var_list in vars_by_room_slot.values():
-            if len(var_list) > 1:
-                model.AddAtMostOne(var_list)
-
-        # R5: Teacher daily hour limit
-        for (tid, day), var_list in vars_by_teacher_day.items():
-            if var_list:
-                model.Add(sum(var_list) <= teacher_map[tid].max_hours_per_day)
-
-        # R10: PROCOM teacher travel (cannot teach in C1 at t, and C2 at t+1)
-        slots_by_day = defaultdict(list)
-        for ts in timeslots:
-            slots_by_day[ts.day].append(ts.slot_index)
+        # We need slot indices per day to enforce contiguous constraints (R10)
+        slots_by_day = collections.defaultdict(list)
+        for ts in problem.timeslots:
+            if ts.slot_index not in slots_by_day[ts.day]:
+                slots_by_day[ts.day].append(ts.slot_index)
         for day in slots_by_day:
             slots_by_day[day].sort()
 
-        for teacher in procom_teachers:
-            if len(teacher.campus_ids) < 2: continue
-            for day in days:
-                day_slots = slots_by_day.get(day, [])
-                for i in range(len(day_slots) - 1):
-                    t_now = day_slots[i]
-                    t_next = day_slots[i+1]
-                    c1, c2 = teacher.campus_ids[0], teacher.campus_ids[1]
-                    
-                    v_c1_now = vars_by_teacher_campus_day_slot.get((teacher.id, c1, day, t_now), [])
-                    v_c2_next = vars_by_teacher_campus_day_slot.get((teacher.id, c2, day, t_next), [])
-                    if v_c1_now and v_c2_next:
-                        # (A => Not B) is equivalent to A + B <= 1
-                        for a in v_c1_now:
-                            for b in v_c2_next:
-                                model.AddImplication(a, b.Not())
-                                
-                    v_c2_now = vars_by_teacher_campus_day_slot.get((teacher.id, c2, day, t_now), [])
-                    v_c1_next = vars_by_teacher_campus_day_slot.get((teacher.id, c1, day, t_next), [])
-                    if v_c2_now and v_c1_next:
-                        for a in v_c2_now:
-                            for b in v_c1_next:
-                                model.AddImplication(a, b.Not())
+        # Pre-groupings to avoid O(T*S*R*TS) loop explosion and OOM
+        teachers_by_campus = collections.defaultdict(list)
+        for t in problem.teachers:
+            for cid in t.campus_ids:
+                teachers_by_campus[cid].append(t)
+                
+        rooms_by_campus = collections.defaultdict(list)
+        for r in problem.rooms:
+            rooms_by_campus[r.campus_id].append(r)
 
-        # R13: PROHES exactly 1/2 ntpphes distinct days
-        for teacher in teachers:
-            if teacher.teacher_type != TeacherType.PROHES:
+        # ── 1. Logical Filtering & Variable Generation ──────────────────────────
+        for s in problem.subjects:
+            valid_rooms = [r for r in rooms_by_campus.get(s.campus_id, []) if r.can_fit(s.student_count)]
+            if not valid_rooms:
                 continue
-            target_days = max(1, teacher.ntpphes // 2)
-            for campus_id in teacher.campus_ids:
-                days_assigned = []
-                for day in days:
-                    daily_vars = vars_by_teacher_campus_day.get((teacher.id, campus_id, day), [])
-                    day_is_active = model.NewBoolVar(f"PROHES_day_{teacher.id}_{campus_id}_{day}")
-                    if daily_vars:
-                        # day_is_active is True if sum(daily_vars) > 0
-                        model.Add(sum(daily_vars) > 0).OnlyEnforceIf(day_is_active)
-                        model.Add(sum(daily_vars) == 0).OnlyEnforceIf(day_is_active.Not())
-                    else:
-                        model.Add(day_is_active == 0)
-                    days_assigned.append(day_is_active)
-                model.Add(sum(days_assigned) == target_days)
+                
+            # Filter valid teachers: Must belong to campus, and if eligible_teacher_ids is set, must be in it.
+            campus_teachers = teachers_by_campus.get(s.campus_id, [])
+            if s.eligible_teacher_ids:
+                valid_teachers = [t for t in campus_teachers if t.id in s.eligible_teacher_ids]
+            else:
+                valid_teachers = campus_teachers
 
-        # ── OBJECTIVE ────────────────────────────────────────────────────────
-        # For CP, we want to maximize preferences or minimize penalties.
-        # In this scale, finding ANY feasible solution is priority #1.
-        # We will add simple soft constraints.
+            for t in valid_teachers:
+                for ts in problem.timeslots:
+                    if t.is_restricted(ts.day, ts.slot_index):
+                        continue
+                    if t.teacher_type == TeacherType.PROJEX and not ts.is_extended_hours:
+                        continue
+
+                    for r in valid_rooms:
+                        # Create the binary decision variable
+                        name = f"x_{t.id}_{s.id}_{r.id}_{ts.day}_{ts.slot_index}"
+                        var = model.NewBoolVar(name)
+
+                        by_subject[s.id].append(var)
+                        by_teacher_slot[(t.id, ts.day, ts.slot_index)].append(var)
+                        by_room_slot[(r.id, ts.day, ts.slot_index)].append(var)
+                        by_teacher_day[(t.id, ts.day)].append(var)
+                        by_teacher_day_campus[(t.id, ts.day, r.campus_id)].append(var)
+                        by_subject_day[(s.id, ts.day)].append(var)
+
+                        var_to_assignment[var] = (
+                            t.id,
+                            s.id,
+                            r.id,
+                            f"{ts.day}_{ts.slot_index}",
+                            s.campus_id,
+                            s.group_id,
+                        )
+
+        # ── 2. Hard Constraints ───────────────────────────────────────────────
+
+        # R6 — Intensity (Exact required sessions)
+        for s in problem.subjects:
+            model.Add(sum(by_subject[s.id]) == s.required_sessions)
+
+        # R4 — No teacher double-booking per slot
+        for vars_list in by_teacher_slot.values():
+            if len(vars_list) > 1:
+                model.AddAtMostOne(vars_list)
+
+        # R7 — No room double-booking per slot
+        for vars_list in by_room_slot.values():
+            if len(vars_list) > 1:
+                model.AddAtMostOne(vars_list)
+
+        # R5 — Daily hour limit per teacher
+        for t in problem.teachers:
+            for day in range(6):
+                day_vars = by_teacher_day.get((t.id, day), [])
+                if day_vars:
+                    model.Add(sum(day_vars) <= t.max_hours_per_day)
+
+        # R10 — PROCOM travel time (cannot teach across campuses in contiguous slots)
+        for t in problem.teachers:
+            if t.teacher_type == TeacherType.PROCOM and len(t.campus_ids) >= 2:
+                for day in range(6):
+                    day_slots = slots_by_day.get(day, [])
+                    for i in range(len(day_slots) - 1):
+                        slot_t = day_slots[i]
+                        slot_t1 = day_slots[i + 1]
+                        
+                        # Only consider actually contiguous slot indices
+                        if slot_t1 != slot_t + 1:
+                            continue
+
+                        # Generate constraints for all pairs of DIFFERENT campuses
+                        for c_a in t.campus_ids:
+                            for c_b in t.campus_ids:
+                                if c_a != c_b:
+                                    # Use by_teacher_slot dictionary and filter by campus manually
+                                    vars_a = [v for v in by_teacher_slot.get((t.id, day, slot_t), []) 
+                                              if var_to_assignment[v].campus_id == c_a]
+                                    vars_b = [v for v in by_teacher_slot.get((t.id, day, slot_t1), []) 
+                                              if var_to_assignment[v].campus_id == c_b]
+                                    
+                                    if vars_a and vars_b:
+                                        model.Add(sum(vars_a) + sum(vars_b) <= 1)
+
+        # R13 — PROHES assigned exactly ½ × ntpphes distinct days per campus
+        for t in problem.teachers:
+            if t.teacher_type == TeacherType.PROHES:
+                target_days = max(1, t.ntpphes // 2)
+                for campus_id in t.campus_ids:
+                    day_indicators = []
+                    for day in range(6):
+                        daily_campus_vars = by_teacher_day_campus.get((t.id, day, campus_id), [])
+                        teaches_on_day = model.NewBoolVar(f"prohes_t{t.id}_c{campus_id}_d{day}")
+                        
+                        if daily_campus_vars:
+                            model.AddMaxEquality(teaches_on_day, daily_campus_vars)
+                        else:
+                            model.Add(teaches_on_day == 0)
+                            
+                        day_indicators.append(teaches_on_day)
+                    
+                    model.Add(sum(day_indicators) == target_days)
+
+        # ── 3. Soft Constraints & Objective ───────────────────────────────────
+        penalties = []
         
-        penalty_terms = []
+        # Use a scaling factor since penalties are floats, CP-SAT requires ints
+        SCALE = 100
+        weight_gap = int(problem.penalty_weights.penalizacion2 * SCALE)
+        weight_transfer = int(problem.penalty_weights.penalizacion1 * SCALE)
 
-        # Gap Penalty (approximated): penalize if a subject is only scheduled once per day
-        for subject in subjects:
-            for day in days:
-                day_vars = vars_by_subject_day.get((subject.id, day), [])
-                if len(day_vars) > 1:
-                    is_gap = model.NewBoolVar(f"Gap_{subject.id}_{day}")
-                    model.Add(sum(day_vars) == 1).OnlyEnforceIf(is_gap)
-                    model.Add(sum(day_vars) != 1).OnlyEnforceIf(is_gap.Not())
-                    penalty_terms.append(is_gap * int(weights.penalizacion2))
+        # Subject gaps: Active if a subject has exactly 1 session on a particular day
+        for s in problem.subjects:
+            for day in range(6):
+                day_vars = by_subject_day.get((s.id, day), [])
+                if day_vars:
+                    sessions = sum(day_vars)
+                    is_gap = model.NewBoolVar(f"gap_s{s.id}_d{day}")
+                    
+                    model.Add(sessions == 1).OnlyEnforceIf(is_gap)
+                    model.Add(sessions != 1).OnlyEnforceIf(is_gap.Not())
+                    
+                    penalties.append(is_gap * weight_gap)
 
-        # Travel Penalty: PROCOM teaching in a campus
-        for teacher in procom_teachers:
-            for cid in teacher.campus_ids:
-                for ts in timeslots:
-                    slot_vars = vars_by_teacher_campus_day_slot.get((teacher.id, cid, ts.day, ts.slot_index), [])
-                    if slot_vars:
-                        is_active = model.NewBoolVar(f"Trv_{teacher.id}_{cid}_{ts.day}_{ts.slot_index}")
-                        model.Add(sum(slot_vars) > 0).OnlyEnforceIf(is_active)
-                        model.Add(sum(slot_vars) == 0).OnlyEnforceIf(is_active.Not())
-                        penalty_terms.append(is_active * int(weights.penalizacion1))
+        # PROCOM transfers: Penalize teaching in >1 campus on the same day
+        for t in problem.teachers:
+            if t.teacher_type == TeacherType.PROCOM:
+                for day in range(6):
+                    campus_indicators = []
+                    for campus_id in t.campus_ids:
+                        daily_campus_vars = by_teacher_day_campus.get((t.id, day, campus_id), [])
+                        if daily_campus_vars:
+                            teaches_in_c = model.NewBoolVar(f"trans_t{t.id}_c{campus_id}_d{day}")
+                            model.AddMaxEquality(teaches_in_c, daily_campus_vars)
+                            campus_indicators.append(teaches_in_c)
+                    
+                    if len(campus_indicators) > 1:
+                        transfers = model.NewIntVar(0, len(campus_indicators) - 1, f"transfers_t{t.id}_d{day}")
+                        model.Add(transfers >= sum(campus_indicators) - 1)
+                        penalties.append(transfers * weight_transfer)
 
-        if penalty_terms:
-            model.Minimize(sum(penalty_terms))
+        if penalties:
+            model.Minimize(sum(penalties))
 
-        # ── SOLVE ────────────────────────────────────────────────────────────
-        logger.info("CP-SAT Model built. Solving with aggressive configuration...")
+        # ── 4. Solve ──────────────────────────────────────────────────────────
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = problem.time_limit_seconds
-        
-        # Maximize CPU usage for speed
-        solver.parameters.num_search_workers = 8  # Use all Mac cores
-        
-        # Aggressive heuristic settings for instant feasibility
-        solver.parameters.cp_model_presolve = True
-        solver.parameters.relative_gap_limit = 0.20  # Accept 20% gap like we did in CBC
+        solver.parameters.num_search_workers = 1  # 1 worker to survive 8GB RAM
         solver.parameters.log_search_progress = True
         
+        logger.info("Starting CP-SAT solver. Time limit: %ds", problem.time_limit_seconds)
+        logger.info("Model size: %d variables, %d constraints", len(model.Proto().variables), len(model.Proto().constraints))
         status = solver.Solve(model)
         
-        solve_time = _time.perf_counter() - t_start
         status_name = solver.StatusName(status)
-        logger.info("CP-SAT finished: status=%s time=%.2fs", status_name, solve_time)
+        logger.info("CP-SAT finished: status=%s", status_name)
 
-        if status == cp_model.INFEASIBLE:
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            assignments = []
+            for var, data in var_to_assignment.items():
+                if solver.Value(var) == 1:
+                    assignments.append(
+                        Assignment(
+                            teacher_id=data[0],
+                            subject_id=data[1],
+                            room_id=data[2],
+                            timeslot_id=data[3],
+                            campus_id=data[4],
+                            group_id=data[5],
+                        )
+                    )
+                    
+            penalty_score = solver.ObjectiveValue() / SCALE if penalties else 0.0
+            
+            return ScheduleResult(
+                assignments=assignments,
+                penalty_score=penalty_score,
+                solver_status=status_name.capitalize(),
+                solve_time_seconds=0.0,  # Filled by caller
+                solver_name="OR-Tools CP-SAT",
+            )
+        elif status == cp_model.INFEASIBLE:
             return ScheduleResult(
                 assignments=[],
                 penalty_score=0.0,
                 solver_status="Infeasible",
-                solve_time_seconds=solve_time,
+                solve_time_seconds=0.0,
                 solver_name="OR-Tools CP-SAT",
             )
-
-        # ── EXTRACT ──────────────────────────────────────────────────────────
-        assignments = []
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            for key, var in X.items():
-                if solver.Value(var):
-                    tid, sid, rid, day, slot_idx = key
-                    subject = subject_map[sid]
-                    assignments.append(
-                        Assignment(
-                            teacher_id=tid,
-                            subject_id=sid,
-                            room_id=rid,
-                            timeslot_id=f"{day}_{slot_idx}",
-                            campus_id=subject.campus_id,
-                            group_id=subject.group_id,
-                        )
-                    )
-
-        return ScheduleResult(
-            assignments=assignments,
-            penalty_score=solver.ObjectiveValue() if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else 0.0,
-            solver_status=status_name,
-            solve_time_seconds=solve_time,
-            solver_name="OR-Tools CP-SAT",
-        )
+        else:
+            return ScheduleResult(
+                assignments=[],
+                penalty_score=0.0,
+                solver_status=status_name.capitalize(),
+                solve_time_seconds=0.0,
+                solver_name="OR-Tools CP-SAT",
+            )
