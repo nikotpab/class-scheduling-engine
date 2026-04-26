@@ -25,6 +25,7 @@ dependencies = [
 
     # Solver
     "PuLP>=2.8.0",
+    "ortools>=9.8.3296",
 
     # Database
     "sqlalchemy>=2.0.30",

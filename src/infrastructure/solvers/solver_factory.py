@@ -4,6 +4,7 @@ from src.domain.ports.i_solver import ISolver
 from src.infrastructure.config.settings import settings
 from src.infrastructure.solvers.pulp_solver import PuLPSolver
 from src.infrastructure.solvers.tabu_solver_stub import TabuSearchSolverStub
+from src.infrastructure.solvers.ortools_solver import OrToolsCPSolver
 
 
 def get_solver(solver_name: str | None = None) -> ISolver:
@@ -17,7 +18,9 @@ def get_solver(solver_name: str | None = None) -> ISolver:
         return PuLPSolver(gap_tolerance=settings.SOLVER_GAP_TOLERANCE)
     elif name == "tabu_search":
         return TabuSearchSolverStub()
+    elif name == "ortools_cpsat":
+        return OrToolsCPSolver()
     else:
         raise ValueError(
-            f"Unknown solver '{name}'. Available: 'pulp_cbc', 'tabu_search'."
+            f"Unknown solver '{name}'. Available: 'pulp_cbc', 'tabu_search', 'ortools_cpsat'."
         )

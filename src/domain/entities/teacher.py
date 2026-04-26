@@ -15,7 +15,7 @@ class TeacherType(str, Enum):
     PROHES = "PROHES"    # Special-schedule teacher — exactly ½×ntpphes days per campus
 
 
-@dataclass(frozen=True)
+@dataclass
 class TeacherAvailability:
     """Maps (day_index, slot_index) → available."""
     slots: frozenset[tuple[int, int]] = field(default_factory=frozenset)

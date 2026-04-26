@@ -13,6 +13,7 @@ class Subject:
     required_sessions: int     # Total weekly periods (intensity = iag in MM.lng)
     campus_id: str             # Primary campus for this subject
     student_count: int = 0    # For room-capacity matching
+    eligible_teacher_ids: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if not self.id:
