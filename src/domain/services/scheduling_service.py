@@ -87,6 +87,9 @@ class SchedulingService:
                 if result.solver_status == "Infeasible":
                     overall_status = "Infeasible"
                     break
+                elif result.solver_status == "Unknown":
+                    overall_status = "Unknown"
+                    break
                     
                 all_assignments.extend(result.assignments)
                 total_penalty += result.penalty_score
