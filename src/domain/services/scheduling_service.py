@@ -31,18 +31,22 @@ class SchedulingService:
 
     async def generate(self, problem: SchedulingProblem, job_id: str) -> Schedule:
         """
-        Run the full scheduling pipeline:
-        1. Create a pending Schedule aggregate.
+        Run the full scheduling workflow:
+        1. Fetch the pending Schedule aggregate.
         2. Persist it (status = RUNNING).
         3. Invoke the solver.
         4. Persist the result.
         5. Publish a domain event for real-time notification.
         """
-        schedule = Schedule(
-            id=str(uuid.uuid4()),
-            job_id=job_id,
-            status=ScheduleStatus.PENDING,
-        )
+        schedule = await self._repository.find_by_job_id(job_id)
+        if not schedule:
+            # Fallback if the placeholder wasn't found for some reason
+            schedule = Schedule(
+                id=str(uuid.uuid4()),
+                job_id=job_id,
+                status=ScheduleStatus.PENDING,
+            )
+            
         schedule.mark_running()
         await self._repository.save(schedule)
 

@@ -76,10 +76,10 @@ class ScheduleGenerationRequest(BaseModel):
     Pydantic v2 enforces all constraints before data reaches the solver,
     preventing parameter-injection attacks on CBC command-line arguments.
     """
-    teachers: Annotated[list[TeacherInput], Field(min_length=1, max_length=500)]
-    subjects: Annotated[list[SubjectInput], Field(min_length=1, max_length=500)]
-    rooms: Annotated[list[RoomInput], Field(min_length=1, max_length=200)]
-    timeslots: Annotated[list[TimeslotInput], Field(min_length=1, max_length=200)]
+    teachers: Annotated[list[TeacherInput], Field(min_length=1, max_length=10000)]
+    subjects: Annotated[list[SubjectInput], Field(min_length=1, max_length=10000)]
+    rooms: Annotated[list[RoomInput], Field(min_length=1, max_length=10000)]
+    timeslots: Annotated[list[TimeslotInput], Field(min_length=1, max_length=10000)]
     penalty_weights: PenaltyWeightsInput = Field(default_factory=PenaltyWeightsInput)
     solver: Literal["pulp_cbc", "tabu_search"] = "pulp_cbc"
     time_limit_seconds: Annotated[int, Field(ge=10, le=3600)] = 300

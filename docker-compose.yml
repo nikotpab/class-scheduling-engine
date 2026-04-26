@@ -14,6 +14,11 @@ x-app-base: &app-base
   restart: unless-stopped
   networks:
     - scheduling-net
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 # ─────────────────────────────────────────────────────────────────────────────
 services:
@@ -40,7 +45,7 @@ services:
       celery -A src.infrastructure.messaging.celery_app:celery_app worker
       --loglevel=info
       --queues=scheduling
-      --concurrency=2
+      --concurrency=1
     healthcheck:
       test: ["CMD-SHELL", "celery -A src.infrastructure.messaging.celery_app:celery_app inspect ping"]
       interval: 30s
@@ -83,7 +88,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: scheduling-redis
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    command: redis-server --appendonly yes
     volumes:
       - redis-data:/data
     ports:
