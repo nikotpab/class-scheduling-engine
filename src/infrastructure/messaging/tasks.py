@@ -32,7 +32,7 @@ async def _run_pipeline(job_id: str, payload: dict) -> dict:
     from src.application.schemas.inputs import ScheduleGenerationRequest
     from src.application.use_cases.generate_schedule import _map_request_to_problem
     from src.domain.services.scheduling_service import SchedulingService
-    from src.infrastructure.persistence.database import AsyncSessionFactory
+    from src.infrastructure.persistence.database import AsyncSessionFactory, engine
     from src.infrastructure.persistence.schedule_repository import SQLAlchemyScheduleRepository
     from src.infrastructure.solvers.solver_factory import get_solver
     from src.infrastructure.websockets.connection_manager import manager
@@ -56,21 +56,26 @@ async def _run_pipeline(job_id: str, payload: dict) -> dict:
 
     solver = get_solver(request.solver)
 
-    async with AsyncSessionFactory() as session:
-        repository = SQLAlchemyScheduleRepository(session)
-        publisher = WebSocketPublisher()
-        service = SchedulingService(
-            solver=solver,
-            repository=repository,
-            publisher=publisher,
-        )
-        schedule = await service.generate(problem, job_id)
+    try:
+        async with AsyncSessionFactory() as session:
+            repository = SQLAlchemyScheduleRepository(session)
+            publisher = WebSocketPublisher()
+            service = SchedulingService(
+                solver=solver,
+                repository=repository,
+                publisher=publisher,
+            )
+            schedule = await service.generate(problem, job_id)
 
-    return {
-        "schedule_id": schedule.id,
-        "status": schedule.status.value,
-        "penalty_score": schedule.penalty_score,
-    }
+        return {
+            "schedule_id": schedule.id,
+            "status": schedule.status.value,
+            "penalty_score": schedule.penalty_score,
+        }
+    finally:
+        # Crucial for Celery + Asyncio: cleanup the engine pool so the next task 
+        # (which will run in a new asyncio.run() loop) doesn't inherit stale locks.
+        await engine.dispose()
 
 
 async def _mark_failed(job_id: str, error: str) -> None:
