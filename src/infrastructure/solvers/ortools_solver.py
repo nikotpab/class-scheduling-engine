@@ -73,12 +73,16 @@ class OrToolsCPSolver(ISolver):
             if not valid_rooms:
                 continue
                 
+            # Restrict search space: only consider the 15 smallest valid rooms to prevent Out of Memory
+            valid_rooms.sort(key=lambda r: r.capacity)
+            valid_rooms = valid_rooms[:15]
+                
             # Filter valid teachers: Must belong to campus, and if eligible_teacher_ids is set, must be in it.
             campus_teachers = teachers_by_campus.get(s.campus_id, [])
-            if s.eligible_teacher_ids:
-                valid_teachers = [t for t in campus_teachers if t.id in s.eligible_teacher_ids]
-            else:
-                valid_teachers = campus_teachers
+            if not s.eligible_teacher_ids:
+                raise SolverError(f"Subject {s.id} is missing eligible_teacher_ids. This causes combinatorial explosion and OOM.")
+                
+            valid_teachers = [t for t in campus_teachers if t.id in s.eligible_teacher_ids]
 
             for t in valid_teachers:
                 for ts in problem.timeslots:
@@ -150,9 +154,9 @@ class OrToolsCPSolver(ISolver):
                                 if c_a != c_b:
                                     # Use by_teacher_slot dictionary and filter by campus manually
                                     vars_a = [v for v in by_teacher_slot.get((t.id, day, slot_t), []) 
-                                              if var_to_assignment[v].campus_id == c_a]
+                                              if var_to_assignment[v][4] == c_a]
                                     vars_b = [v for v in by_teacher_slot.get((t.id, day, slot_t1), []) 
-                                              if var_to_assignment[v].campus_id == c_b]
+                                              if var_to_assignment[v][4] == c_b]
                                     
                                     if vars_a and vars_b:
                                         model.Add(sum(vars_a) + sum(vars_b) <= 1)
@@ -219,8 +223,10 @@ class OrToolsCPSolver(ISolver):
 
         # ── 4. Solve ──────────────────────────────────────────────────────────
         solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = 4
         solver.parameters.max_time_in_seconds = problem.time_limit_seconds
-        solver.parameters.num_search_workers = 1  # 1 worker to survive 8GB RAM
+        solver.parameters.max_memory_in_mb = 4096
+        solver.parameters.linearization_level = 0
         solver.parameters.log_search_progress = True
         
         logger.info("Starting CP-SAT solver. Time limit: %ds", problem.time_limit_seconds)
