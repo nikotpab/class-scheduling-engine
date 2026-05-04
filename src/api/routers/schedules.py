@@ -15,6 +15,24 @@ router = APIRouter(prefix="/api/v1/schedules", tags=["Schedules"])
 
 
 @router.post(
+    "/optimize",
+    response_model=JobSubmittedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit a schedule optimization job",
+    description=(
+        "Similar to /generate, but specifically for optimizing existing or new constraints. "
+        "Enqueues a background task and returns a job_id."
+    ),
+)
+async def optimize_schedule(
+    request: Request,
+    body: ScheduleGenerationRequest,
+    use_case: GenerateScheduleUseCase = Depends(get_generate_use_case),
+) -> JobSubmittedResponse:
+    return await use_case.execute(body)
+
+
+@router.post(
     "/generate",
     response_model=JobSubmittedResponse,
     status_code=status.HTTP_202_ACCEPTED,
