@@ -108,5 +108,5 @@ class GenerateScheduleUseCase:
 
         return JobSubmittedResponse(
             job_id=job_id,
-            ws_url=f"{base_url}/ws/{job_id}",
+            ws_url=f"/ws/{job_id}",
         )
